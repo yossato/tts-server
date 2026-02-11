@@ -1,9 +1,10 @@
-"""Qwen3-TTS HTTP Server with Web UI"""
+"""Qwen3-TTS HTTP Server with Web UI — 動的モデル切り替え対応"""
 
 import io
 import queue
 import threading
 import time
+from typing import Dict, Optional
 
 import numpy as np
 import sounddevice as sd
@@ -14,27 +15,53 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from mlx_audio.tts.utils import load_model
 from pydantic import BaseModel
 
-MODEL_ID = "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16"
 SAMPLE_RATE = 24000
 
-print(f"Loading model: {MODEL_ID}")
-model = load_model(MODEL_ID)
-speakers = model.get_supported_speakers()
+# モデルキャッシュ（複数モデルを保持）
+MODEL_CACHE: Dict[str, any] = {}
+
+# モデルID マッピング
+MODEL_IDS = {
+    "0.6B-8bit": "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit",
+    "1.7B-bf16": "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16",
+}
+
+# デフォルトモデルをプリロード
+DEFAULT_MODEL = "0.6B-8bit"
+print(f"Loading default model: {MODEL_IDS[DEFAULT_MODEL]}")
+MODEL_CACHE[DEFAULT_MODEL] = load_model(MODEL_IDS[DEFAULT_MODEL])
+speakers = MODEL_CACHE[DEFAULT_MODEL].get_supported_speakers()
 print(f"Available speakers: {speakers}")
-print("Model loaded. Starting server...")
+print("Default model loaded. Starting server...")
 
 app = FastAPI()
 
 
+def get_model(model_key: str = DEFAULT_MODEL):
+    """モデルを取得（キャッシュになければロード）"""
+    if model_key not in MODEL_CACHE:
+        if model_key not in MODEL_IDS:
+            raise ValueError(f"Unknown model: {model_key}. Available: {list(MODEL_IDS.keys())}")
+        
+        print(f"Loading model: {MODEL_IDS[model_key]}")
+        MODEL_CACHE[model_key] = load_model(MODEL_IDS[model_key])
+        print(f"Model {model_key} loaded and cached.")
+    
+    return MODEL_CACHE[model_key]
+
+
 class TTSRequest(BaseModel):
     text: str
-    speaker: str = "Aiden"
+    speaker: str = "ono_anna"
     instruct: str = "落ち着いた声で、はっきりとした発音。"
     language: str = "Japanese"
+    model: str = DEFAULT_MODEL  # "0.6B-8bit" or "1.7B-bf16"
 
 
 @app.post("/tts")
 def generate_tts(req: TTSRequest):
+    model = get_model(req.model)
+    
     start = time.perf_counter()
     results = list(model.generate_custom_voice(
         text=req.text,
@@ -58,6 +85,7 @@ def generate_tts(req: TTSRequest):
             "X-Generation-Time": f"{elapsed:.2f}",
             "X-Audio-Duration": f"{duration:.2f}",
             "X-RTF": f"{elapsed / duration:.3f}",
+            "X-Model": req.model,
         },
     )
 
@@ -68,6 +96,7 @@ PREFILL_CHUNKS = 3
 @app.post("/tts/stream-play")
 def stream_play_tts(req: TTSRequest):
     """Generate and play audio via streaming on the server (gapless OutputStream)."""
+    model = get_model(req.model)
     start = time.perf_counter()
 
     audio_queue = queue.Queue(maxsize=8)
@@ -116,7 +145,18 @@ def stream_play_tts(req: TTSRequest):
         "audio_duration": round(duration, 2),
         "generation_time": round(elapsed, 2),
         "rtf": round(elapsed / duration, 3),
+        "model": req.model,
     })
+
+
+@app.get("/models")
+def get_models():
+    """利用可能なモデル一覧を取得"""
+    return {
+        "models": list(MODEL_IDS.keys()),
+        "model_details": MODEL_IDS,
+        "cached_models": list(MODEL_CACHE.keys()),
+    }
 
 
 @app.get("/speakers")
