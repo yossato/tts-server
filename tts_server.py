@@ -1,13 +1,16 @@
 """Qwen3-TTS HTTP Server with Web UI"""
 
 import io
+import queue
+import threading
 import time
 
 import numpy as np
+import sounddevice as sd
 import soundfile as sf
 import uvicorn
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from mlx_audio.tts.utils import load_model
 from pydantic import BaseModel
 
@@ -57,6 +60,63 @@ def generate_tts(req: TTSRequest):
             "X-RTF": f"{elapsed / duration:.3f}",
         },
     )
+
+
+PREFILL_CHUNKS = 3
+
+
+@app.post("/tts/stream-play")
+def stream_play_tts(req: TTSRequest):
+    """Generate and play audio via streaming on the server (gapless OutputStream)."""
+    start = time.perf_counter()
+
+    audio_queue = queue.Queue(maxsize=8)
+    start_event = threading.Event()
+
+    def player():
+        start_event.wait()
+        with sd.OutputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32") as stream:
+            while True:
+                chunk = audio_queue.get()
+                if chunk is None:
+                    break
+                stream.write(chunk.reshape(-1, 1))
+
+    player_thread = threading.Thread(target=player, daemon=True)
+    player_thread.start()
+
+    all_chunks = []
+    chunk_count = 0
+    for result in model.generate_custom_voice(
+        text=req.text,
+        speaker=req.speaker,
+        language=req.language,
+        instruct=req.instruct,
+        stream=True,
+        streaming_interval=2.0,
+    ):
+        chunk_count += 1
+        audio = np.array(result.audio, dtype=np.float32)
+        audio_queue.put(audio)
+        all_chunks.append(audio)
+        if chunk_count == PREFILL_CHUNKS:
+            start_event.set()
+
+    start_event.set()
+    audio_queue.put(None)
+    player_thread.join()
+
+    elapsed = time.perf_counter() - start
+    combined = np.concatenate(all_chunks)
+    duration = len(combined) / SAMPLE_RATE
+
+    return JSONResponse({
+        "status": "ok",
+        "chunks": chunk_count,
+        "audio_duration": round(duration, 2),
+        "generation_time": round(elapsed, 2),
+        "rtf": round(elapsed / duration, 3),
+    })
 
 
 @app.get("/speakers")
